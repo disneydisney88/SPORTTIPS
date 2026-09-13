@@ -14,6 +14,9 @@ TIANXI_BASE = "https://raw.githubusercontent.com/sleepingarhat/tianxi-database/m
 TIANXI_REPO = "https://github.com/sleepingarhat/tianxi-database"
 _TIANXI_CREDIT = "tianxi-database (sleepingarhat) — HKJC public data, CC use with attribution"
 
+# This app's own repo — the durable tips store committed by GitHub Actions
+SELF_TIPS_URL = "https://raw.githubusercontent.com/disneydisney88/SPORTTIPS/master/data/tips.csv"
+
 HEADERS = {"User-Agent": "SPORTTIPS-app/1.0 (free data aggregation)"}
 
 
@@ -96,6 +99,18 @@ def horse_vocab() -> set[str]:
         if base:
             vocab.add(base)
     return vocab
+
+
+def remote_tips() -> pd.DataFrame:
+    """Tips committed to this repo by GitHub Actions — the durable fallback
+    when a live fetch from the app host is blocked or times out."""
+    txt = _get_text(SELF_TIPS_URL)
+    if not txt:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(StringIO(txt), dtype=str, encoding="utf-8-sig")
+    except Exception:
+        return pd.DataFrame()
 
 
 def race_card(race_day: str) -> dict | None:

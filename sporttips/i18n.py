@@ -37,6 +37,10 @@ STRINGS = {
     "col_fitness": {"zh": "健態", "en": "Fitness"},
     "col_tips": {"zh": "⭐ 貼士", "en": "⭐ Tips"},
     "no_tips": {"zh": "暫時搵唔到貼士。", "en": "No tips found yet."},
+    "search_fallback": {
+        "zh": "即時搜尋暫時連唔上（雲端伺服器IP有時被報網擋）。以下係資料庫最新貼士 — GitHub Actions 每日自動更新，開返轉頭就有即時嘅。",
+        "en": "Live search temporarily unreachable (datacenter IPs are sometimes blocked by the publisher). Showing the latest tips from the store — GitHub Actions refreshes them daily.",
+    },
     "search_days": {"zh": "搜尋最近日數", "en": "Search last N days"},
     "news_tips": {"zh": "星島頭條馬經貼士（註明來源）", "en": "ST Headline tips (sources cited)"},
     "col_source": {"zh": "來源", "en": "Source"},

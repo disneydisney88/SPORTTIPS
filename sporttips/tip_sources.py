@@ -38,10 +38,10 @@ def parse_quoted_names(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------- source --
-def fetch_stheadline(max_articles: int = 12, days: int = 4, vocab: set[str] | None = None) -> list[dict]:
+def fetch_stheadline(max_articles: int = 8, days: int = 4, vocab: set[str] | None = None) -> list[dict]:
     """Latest racing-tipster articles (title + body names + tipster + link)."""
     try:
-        r = requests.get(STHEADLINE_RSS, headers=HEADERS, timeout=20)
+        r = requests.get(STHEADLINE_RSS, headers=HEADERS, timeout=15)
         if r.status_code != 200:
             return []
         root = ET.fromstring(r.content)
@@ -76,7 +76,7 @@ def fetch_stheadline(max_articles: int = 12, days: int = 4, vocab: set[str] | No
         if not art["url"].startswith("https://www.stheadline.com/"):
             continue
         try:
-            ar = requests.get(art["url"], headers=HEADERS, timeout=15)
+            ar = requests.get(art["url"], headers=HEADERS, timeout=12)
             if ar.status_code == 200:
                 for n in parse_quoted_names(ar.text):
                     if n not in art["names"]:

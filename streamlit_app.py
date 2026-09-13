@@ -47,6 +47,12 @@ def _race_card(day: str) -> dict | None:
     return data_hub.race_card(day)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _remote_tips() -> pd.DataFrame:
+    """Latest tips committed to the repo by GitHub Actions (durable store)."""
+    return data_hub.remote_tips()
+
+
 def _L(key: str) -> str:
     return t(key, st.session_state.lang)
 
@@ -67,6 +73,15 @@ def _auto_update() -> None:
 
 _auto_update()
 tips_all = storage.load_tips()
+remote = _remote_tips()
+if not remote.empty:
+    tips_all = (
+        pd.concat([tips_all, remote], ignore_index=True)
+        .drop_duplicates(
+            subset=["url", "race_date", "race_no", "horse_no", "horse_name", "source", "tipster", "kind"],
+            keep="last",
+        )
+    )
 
 # ------------------------------------------------------------------ sidebar --
 with st.sidebar:
@@ -240,7 +255,20 @@ elif page == "nav_search":
 
     df = st.session_state.search_df
     if df.empty:
-        st.caption(_L("no_tips"))
+        st.info(_L("search_fallback"))
+        if not tips_all.empty:
+            arts = tips_all.drop_duplicates(subset=["url"])
+            st.dataframe(
+                arts[["race_date", "tipster", "title", "source", "url"]].head(50),
+                column_config={
+                    "title": st.column_config.TextColumn(_L("col_title"), width="large"),
+                    "tipster": st.column_config.TextColumn("Tipster"),
+                    "source": st.column_config.TextColumn(_L("col_source")),
+                    "url": st.column_config.LinkColumn(_L("col_link"), display_text="🔗"),
+                },
+                width="stretch",
+                hide_index=True,
+            )
     else:
         arts = df.drop_duplicates(subset=["url"])
         st.markdown(f"**{len(arts)}** 篇文章 · **{len(df)}** {_L('col_mentions')}")
