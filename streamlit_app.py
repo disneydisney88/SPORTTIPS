@@ -58,16 +58,20 @@ def _remote_tips() -> pd.DataFrame:
     return data_hub.remote_tips()
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def _form_summaries(day: str, brandnos: tuple[str, ...]) -> dict:
-    """Per-horse career summary + jockey combo, fetched in parallel."""
-    def one(b: str):
-        s = data_hub.horse_form_summary(b)
-        combo = data_hub.jockey_combo(b, s.get("last_jockey", "")) if s else {}
-        return b, {"sum": s, "combo": combo}
+@st.cache_data(ttl=900, show_spinner=False)
+def _hkjc_meeting(day: str) -> dict | None:
+    return data_hub.hkjc_meeting(day)
 
-    with ThreadPoolExecutor(16) as ex:
-        return dict(ex.map(one, brandnos))
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _horse_stats(day: str, brand: str, jockey: str) -> dict:
+    return data_hub.horse_stats(brand, jockey)
+
+
+def _prewarm_stats(day: str, jobs: list[tuple[str, str]]) -> None:
+    if jobs:
+        with ThreadPoolExecutor(16) as ex:
+            list(ex.map(lambda j: _horse_stats(day, j[0], j[1]), jobs))
 
 
 def _L(key: str) -> str:
@@ -193,40 +197,79 @@ if page == "nav_today":
             card_day = d
             break
 
-    if not card:
+    # official HKJC meeting — jockey/trainer/draw/weight/rating/last6/odds
+    hk = _hkjc_meeting(card_day) if card_day else None
+
+    if not card and not hk:
         st.warning(_L("card_none"))
     else:
         title = _L("card_title") if card_day == today.isoformat() else _L("card_of").format(d=card_day)
-        st.subheader(f"🏇 {title} · {card.get('venue','')}")
+        st.subheader(f"🏇 {title} · {hk.get('venueCode') if hk else (card.get('venue','') if card else '')}")
+        if hk:
+            pene = (hk.get("penetrometerReadings") or [{}])[0].get("reading", "")
+            if pene:
+                st.caption(f"💧 {_L('col_pene')}: {pene}")
         num_map, name_map = _tip_maps(card_day)
-        day_tips = tips_all[tips_all["race_date"].isin(
-            {(dt.date.fromisoformat(card_day) - dt.timedelta(days=1)).isoformat(), card_day,
-             (dt.date.fromisoformat(card_day) + dt.timedelta(days=1)).isoformat()}
-        )] if not tips_all.empty else pd.DataFrame()
+        d0 = dt.date.fromisoformat(card_day)
+        day_keys = {
+            (d0 - dt.timedelta(days=1)).isoformat(),
+            card_day,
+            (d0 + dt.timedelta(days=1)).isoformat(),
+        }
+        day_tips = tips_all[tips_all["race_date"].isin(day_keys)] if not tips_all.empty else pd.DataFrame()
 
         c1, c2, c3 = st.columns(3)
-        c1.metric(_L("metric_races"), len(card["races"]))
+        race_count = len(hk.get("races") or []) if hk else len(card["races"])
+        c1.metric(_L("metric_races"), race_count)
         c2.metric(_L("metric_tips"), len(day_tips))
         c3.metric(_L("metric_tipsters"), day_tips["tipster"].nunique() if not day_tips.empty else 0)
 
-        brandnos = tuple(
-            str(r.get("brandno") or "").strip().upper()
-            for race in card["races"] for r in race.get("energy", [])
-            if str(r.get("brandno") or "").strip()
-        )
-        summaries = _form_summaries(card_day, tuple(sorted(set(brandnos))))
+        # SpeedPro energy lookup keyed by (race_no, runner_no)
+        sp: dict[tuple[str, str], dict] = {}
+        for race in (card.get("races") or [] if card else []):
+            rn = str(race.get("raceno", ""))
+            for r in race.get("energy", []):
+                sp[(rn, str(r.get("runnernumber")).strip())] = r
 
-        for race in card["races"]:
-            info = race.get("raceinfo_chi") or race.get("raceinfo_eng") or {}
-            en = st.session_state.lang == "en"
-            rname = (race.get("raceinfo_eng") or info).get("RaceName", "") if en else info.get("RaceName", "")
-            raceno = str(race.get("raceno", "?"))
-            label = _L("race_x").format(
-                n=race.get("raceno", "?"),
-                name=rname, dist=info.get("Distance", ""), cls=info.get("RaceClass", ""),
-                time=info.get("PostTime", ""),
-            )
-            runners = [r for r in race.get("energy", []) if not r.get("scratched")]
+        jobs: list[tuple[str, str]] = []
+        if hk:
+            for race in hk.get("races", []):
+                for r in race.get("runners", []):
+                    b = str((r.get("horse") or {}).get("code") or "").strip().upper()
+                    j = str((r.get("jockey") or {}).get("name_ch") or "").strip()
+                    if b:
+                        jobs.append((b, j))
+        elif card:
+            for race in card.get("races", []):
+                for r in race.get("energy", []):
+                    b = str(r.get("brandno") or "").strip().upper()
+                    if b:
+                        jobs.append((b, ""))
+        _prewarm_stats(card_day, sorted(set(jobs)))
+
+        en = st.session_state.lang == "en"
+        races_iter = hk.get("races") if hk else (card.get("races") or [])
+        for race in races_iter:
+            if hk:
+                raceno = str(race.get("no", "?"))
+                rname = (race.get("raceName_ch") if not en else race.get("raceName_en")) or ""
+                dist = f"{race.get('distance')}m" if race.get("distance") else ""
+                cls = race.get("raceClass_ch") if not en else race.get("raceClass_en")
+                ptime = race.get("postTime", "")
+                raw_runners = race.get("runners", [])
+                runners = [
+                    r for r in raw_runners
+                    if not r.get("status") or ("scratch" not in str(r["status"]).lower()
+                                               and "reserve" not in str(r["status"]).lower())
+                ]
+            else:
+                info = race.get("raceinfo_chi") or race.get("raceinfo_eng") or {}
+                raceno = str(race.get("raceno", "?"))
+                rname = info.get("RaceName", "")
+                dist, cls, ptime = info.get("Distance", ""), info.get("RaceClass", ""), info.get("PostTime", "")
+                runners = [r for r in race.get("energy", []) if not r.get("scratched")]
+
+            label = _L("race_x").format(n=raceno, name=rname, dist=dist, cls=cls, time=ptime)
 
             # per-tipster picks line for this race (from numbered tips)
             tip_lines = []
@@ -244,40 +287,65 @@ if page == "nav_today":
 
             rows = []
             for r in runners:
-                brand = str(r.get("brandno") or "").strip().upper()
-                nm_chi = str(r.get("name_chi") or "").strip()
-                nm_en = str(r.get("name_eng") or r.get("name") or "").strip()
-                display_name = nm_en if en else nm_chi
-                who = list(num_map.get((raceno, str(r.get("runnernumber")).strip()), []))
+                if hk:
+                    rn = str(r.get("no"))
+                    brand = str((r.get("horse") or {}).get("code") or "").strip().upper()
+                    nm_chi = str(r.get("name_ch") or "").strip()
+                    display_name = (r.get("name_en") if en else nm_chi) or nm_chi
+                    jockey = ((r.get("jockey") or {}).get("name_ch" if not en else "name_en")) or "—"
+                    trainer = ((r.get("trainer") or {}).get("name_ch" if not en else "name_en")) or "—"
+                    draw, weight = r.get("barrierDrawNumber"), r.get("handicapWeight")
+                    rating = r.get("currentRating")
+                    last6 = str(r.get("last6run") or "").replace("/", "-") or "—"
+                    try:
+                        odds = f"{float(r.get('winOdds')):g}"
+                    except (TypeError, ValueError):
+                        odds = "—"
+                    today_jockey = str((r.get("jockey") or {}).get("name_ch") or "").strip()
+                else:
+                    rn = str(r.get("runnernumber"))
+                    brand = str(r.get("brandno") or "").strip().upper()
+                    nm_chi = str(r.get("name_chi") or "").strip()
+                    display_name = (r.get("name_eng") if en else nm_chi) or nm_chi
+                    jockey = trainer = "—"
+                    draw, weight, rating = r.get("draw"), "—", "—"
+                    last6, odds = "—", "—"
+                    today_jockey = ""
+
+                spx = sp.get((raceno, rn), {})
+                energy = str(spx.get("speedproenergy") or "").strip() or "—"
+                fitness = str(spx.get("fitnessrating") or "").strip() or "—"
+
+                who = list(num_map.get((raceno, rn), []))
                 who += [w for w in name_map.get(norm_name(nm_chi), []) if w not in who]
-                if not en and who:
+                if who:
                     display_name = f"⭐ {display_name}"
 
-                fs = summaries.get(brand, {}).get("sum", {})
-                combo = summaries.get(brand, {}).get("combo", {})
-                if fs:
-                    record = _fmt_record(fs)
-                    last_jockey = fs.get("last_jockey", "")
+                stats = _horse_stats(card_day, brand, today_jockey) if brand else {}
+                if stats:
+                    record = _fmt_record(stats)
+                    cb = stats.get("combo", {})
                     combo_txt = (
-                        f"{combo['runs']}{_L('runs_unit')}{combo['wins']}{_L('win_unit')}{combo['places'] - combo['wins']}{_L('place_unit')}"
-                        if combo else "—"
+                        f"{cb['jockey']} {cb['runs']}{_L('runs_unit')}{cb['wins']}{_L('win_unit')}{cb['places']-cb['wins']}{_L('place_unit')}"
+                        if cb.get("runs") else "—"
                     )
                 else:
-                    record, last_jockey, combo_txt = "—", "—", "—"
-                try:
-                    energy = int(str(r.get("speedproenergy") or "0").strip() or 0)
-                except ValueError:
-                    energy = 0
+                    record, combo_txt = "—", "—"
+
                 rows.append({
-                    _L("col_runner"): r.get("runnernumber"),
+                    _L("col_runner"): rn,
                     _L("col_horse2"): display_name,
-                    _L("col_draw"): r.get("draw"),
+                    _L("col_jockey2"): jockey,
+                    _L("col_trainer"): trainer,
+                    _L("col_draw"): draw,
+                    _L("col_weight"): weight,
+                    _L("col_rating"): rating,
+                    _L("col_last6"): last6,
+                    _L("col_odds"): odds,
                     _L("col_energy"): energy,
-                    _L("col_diff"): r.get("speedproenergydifference"),
-                    _L("col_fitness"): r.get("fitnessrating"),
+                    _L("col_fitness"): fitness,
                     _L("col_record"): record,
-                    _L("col_last_jockey"): last_jockey,
-                    _L("col_combo"): combo_txt,
+                    _L("col_combo2"): combo_txt,
                     _L("col_tips"): "、".join(who),
                 })
 
@@ -285,16 +353,7 @@ if page == "nav_today":
             with st.expander(label, expanded=has_tips):
                 if tip_lines:
                     st.markdown(("🎯 " + "　|　".join(tip_lines)))
-                st.dataframe(
-                    pd.DataFrame(rows),
-                    hide_index=True,
-                    width="stretch",
-                    column_config={
-                        _L("col_energy"): st.column_config.ProgressColumn(
-                            _L("col_energy"), min_value=0, max_value=120,
-                        ),
-                    },
-                )
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=380)
 
     recent = data_hub.recent_race_days(dt.date.today(), 1)
     if recent:
