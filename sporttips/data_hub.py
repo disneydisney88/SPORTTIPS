@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Free HKJC racing data via the public tianxi-database GitHub repo (CSV on raw.githubusercontent.com)."""
+"""Free HKJC racing data via the public tianxi-database GitHub repo (CSV/JSON on raw.githubusercontent.com)."""
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 from io import StringIO
 
@@ -95,6 +96,18 @@ def horse_vocab() -> set[str]:
         if base:
             vocab.add(base)
     return vocab
+
+
+def race_card(race_day: str) -> dict | None:
+    """Full meeting card from HKJC SpeedPro data (per race: runners, draw, energy)."""
+    for venue in ("ST", "HV"):
+        txt = _get_text(f"speedpro/data/{race_day}_{venue}.json")
+        if txt:
+            try:
+                return json.loads(txt)
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 def next_race_days(after: dt.date, n: int = 3) -> list[dt.date]:
