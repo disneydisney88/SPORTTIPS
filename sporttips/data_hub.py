@@ -113,6 +113,99 @@ def remote_tips() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def horse_form_summary(brand_no: str) -> dict:
+    """Compact career summary for one horse brand number (e.g. 'K104')."""
+    df = horse_form(brand_no)
+    if df is None or df.empty:
+        return {}
+    placed = pd.to_numeric(df["place"], errors="coerce")
+    valid = placed.dropna()
+    runs = int(valid.shape[0])
+    if not runs:
+        return {}
+    wins = int((valid == 1).sum())
+    places = int(valid.between(1, 3).sum())
+    last5 = [int(p) for p in valid.head(5).tolist()]
+    last_date = df["date"].dropna().max()
+    days_since = ""
+    last_jockey = str(df.iloc[0].get("jockey", "") or "").strip()
+    if pd.notna(last_date):
+        days_since = (dt.date.today() - last_date.date()).days
+    return {
+        "runs": runs,
+        "wins": wins,
+        "places": places,
+        "win_rate": wins / runs,
+        "place_rate": places / runs,
+        "last5": last5,
+        "last_date": last_date.strftime("%d/%m") if pd.notna(last_date) else "",
+        "days_since": days_since,
+        "last_jockey": last_jockey,
+        "best_dist": _best_distance(df, placed),
+    }
+
+
+def _best_distance(df: pd.DataFrame, placed: pd.Series) -> str:
+    """Distance (m) with the best average finish for this horse."""
+    d = df.assign(p=placed).dropna(subset=["p", "distance_m"])
+    if d.empty:
+        return ""
+    agg = d.groupby("distance_m")["p"].agg(["mean", "count"])
+    agg = agg[agg["count"] >= 2]
+    if agg.empty:
+        return ""
+    return f"{int(agg['mean'].idxmin())}m"
+
+
+def jockey_combo(brand_no: str, jockey_name: str) -> dict:
+    """History of horse + jockey pairing from the horse's career form."""
+    if not jockey_name:
+        return {}
+    df = horse_form(brand_no)
+    if df is None or df.empty:
+        return {}
+    rides = df[df["jockey"].astype(str).str.strip() == jockey_name]
+    placed = pd.to_numeric(rides["place"], errors="coerce").dropna()
+    runs = int(placed.shape[0])
+    if not runs:
+        return {}
+    return {
+        "runs": runs,
+        "wins": int((placed == 1).sum()),
+        "places": int(placed.between(1, 3).sum()),
+    }
+
+
+def jockey_profiles() -> pd.DataFrame:
+    """Current-season jockey statistics (parsed from the tianxi profiles CSV)."""
+    txt = _get_text("jockeys/jockey_profiles.csv")
+    if not txt:
+        return pd.DataFrame()
+    try:
+        raw = pd.read_csv(StringIO(txt), encoding="utf-8-sig")
+    except Exception:
+        return pd.DataFrame()
+
+    def _num(cell, pattern: str) -> float:
+        m = re.search(pattern, str(cell or ""))
+        return float(m.group(1)) if m else float("nan")
+
+    out = pd.DataFrame(
+        {
+            "jockey": raw.get("jockey_name", "").astype(str).str.strip(),
+            "rides": pd.to_numeric(raw.get("current_總出賽次數"), errors="coerce"),
+            "win_pct": pd.to_numeric(
+                raw.get("current_勝出率").astype(str).str.rstrip("%"), errors="coerce"
+            ),
+            "win_cnt": raw.get("current_國籍").map(lambda c: _num(c, r"冠\s*:\s*(\d+)")),
+            "place2_cnt": raw.get("current_所贏獎金").map(lambda c: _num(c, r"亞\s*:\s*(\d+)")),
+            "place3_cnt": raw.get("current_過去10個賽馬日\n獲勝次數").map(lambda c: _num(c, r"季\s*:\s*(\d+)")),
+        }
+    )
+    out["place_pct"] = (out["place2_cnt"] + out["place3_cnt"]) / out["rides"] * 100
+    return out.dropna(subset=["rides"]).sort_values("win_pct", ascending=False)
+
+
 def race_card(race_day: str) -> dict | None:
     """Full meeting card from HKJC SpeedPro data (per race: runners, draw, energy)."""
     for venue in ("ST", "HV"):

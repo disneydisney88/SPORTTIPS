@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """SPORTTIPS — free HK racing tips platform (繁中/English).
 
-Tips come from 星島頭條「馬經」tipster columns, always attributed.
-Race cards (per race, per runner) come from free HKJC SpeedPro data.
-Data refreshes automatically when the page opens; GitHub Actions keeps
-the repo store fresh daily.
+Tips: 東網馬經 (structured picks w/ race+horse numbers) + 星島頭條 tipster
+columns — always attributed. Race cards: free HKJC SpeedPro data. Past
+records & jockey-horse combos: tianxi-database form records. Data refreshes
+when the page opens; GitHub Actions keeps the repo store fresh daily.
 """
 from __future__ import annotations
 
 import datetime as dt
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import plotly.express as px
@@ -42,6 +43,11 @@ def _horse_form(code: str) -> pd.DataFrame | None:
     return data_hub.horse_form(code)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _jockey_profiles() -> pd.DataFrame:
+    return data_hub.jockey_profiles()
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def _race_card(day: str) -> dict | None:
     return data_hub.race_card(day)
@@ -49,8 +55,19 @@ def _race_card(day: str) -> dict | None:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def _remote_tips() -> pd.DataFrame:
-    """Latest tips committed to the repo by GitHub Actions (durable store)."""
     return data_hub.remote_tips()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _form_summaries(day: str, brandnos: tuple[str, ...]) -> dict:
+    """Per-horse career summary + jockey combo, fetched in parallel."""
+    def one(b: str):
+        s = data_hub.horse_form_summary(b)
+        combo = data_hub.jockey_combo(b, s.get("last_jockey", "")) if s else {}
+        return b, {"sum": s, "combo": combo}
+
+    with ThreadPoolExecutor(16) as ex:
+        return dict(ex.map(one, brandnos))
 
 
 def _L(key: str) -> str:
@@ -58,7 +75,6 @@ def _L(key: str) -> str:
 
 
 def _auto_update() -> None:
-    """Refresh tips silently when the page opens (throttled to once per 45 min)."""
     now = time.time()
     if now - st.session_state.get("_last_auto", 0) < 45 * 60:
         return
@@ -98,13 +114,7 @@ with st.sidebar:
     st.session_state.lang = "zh" if choice == "繁中" else "en"
 
     st.divider()
-    page = st.radio(
-        "PAGE",
-        PAGES,
-        format_func=lambda k: _L(k),
-        label_visibility="collapsed",
-        key="page",
-    )
+    page = st.radio("PAGE", PAGES, format_func=lambda k: _L(k), label_visibility="collapsed", key="page")
 
     st.divider()
     if st.button(_L("btn_update"), width="stretch", type="primary"):
@@ -118,29 +128,35 @@ with st.sidebar:
         st.caption(f"{_L('col_date')}: {tips_all['fetched_at'].max()} · {len(tips_all)} rows")
 
 
-def _tips_by_name(day_keys: set[str]) -> dict[str, list[str]]:
-    """Map normalised horse name -> tipsters, from tips in the given race dates."""
+def _tip_maps(day_iso: str) -> tuple[dict, dict]:
+    """(number_map, name_map) for tips within ±1 day of the card date."""
+    d0 = dt.date.fromisoformat(day_iso)
+    keys = {(d0 - dt.timedelta(days=1)).isoformat(), d0.isoformat(), (d0 + dt.timedelta(days=1)).isoformat()}
+    num_map: dict[tuple[str, str], list[str]] = {}
+    name_map: dict[str, list[str]] = {}
     if tips_all.empty:
-        return {}
-    recent = tips_all[tips_all["race_date"].isin(day_keys)]
-    out: dict[str, list[str]] = {}
-    for _, r in recent.iterrows():
-        nm = norm_name(r.get("horse_name", ""))
-        if not nm:
-            continue
+        return num_map, name_map
+    for _, r in tips_all[tips_all["race_date"].isin(keys)].iterrows():
         who = str(r.get("tipster") or r.get("source") or "").strip()
-        bucket = out.setdefault(nm, [])
-        if who and who not in bucket:
-            bucket.append(who)
-    return out
+        if not who:
+            continue
+        rn = str(r.get("race_no") or "").strip().replace(".0", "")
+        hn = str(r.get("horse_no") or "").strip().replace(".0", "")
+        nm = norm_name(r.get("horse_name", ""))
+        if rn and hn:
+            num_map.setdefault((rn, hn), [])
+            if who not in num_map[(rn, hn)]:
+                num_map[(rn, hn)].append(who)
+        if nm:
+            name_map.setdefault(nm, [])
+            if who not in name_map[nm]:
+                name_map[nm].append(who)
+    return num_map, name_map
 
 
 def _card_dates() -> list[str]:
-    """Candidate dates that may have a SpeedPro card: today, next fixtures, last ones."""
     today = dt.date.today()
-    dates = [today]
-    dates += data_hub.next_race_days(today, 3)
-    dates += data_hub.recent_race_days(today, 2)
+    dates = [today] + data_hub.next_race_days(today, 3) + data_hub.recent_race_days(today, 2)
     seen, out = set(), []
     for d in dates:
         iso = d.isoformat() if hasattr(d, "isoformat") else str(d)
@@ -148,6 +164,14 @@ def _card_dates() -> list[str]:
             seen.add(iso)
             out.append(iso)
     return out
+
+
+def _fmt_record(s: dict) -> str:
+    if not s:
+        return "—"
+    last5 = "-".join(str(p) for p in s.get("last5", []))
+    base = f"{s['runs']}{_L('runs_unit')} {s['wins']}{_L('win_unit')}{s['places'] - s['wins']}{_L('place_unit')}"
+    return f"{base}\n{last5} · {s.get('best_dist','')}"
 
 
 # ------------------------------------------------------------------- pages --
@@ -162,9 +186,7 @@ if page == "nav_today":
         nxt = data_hub.next_race_days(today, 3)
         st.info(f"{_L('today_no_race')} — {_L('today_next').format(d=', '.join(map(str, nxt)))}")
 
-    # --- race card (per race), from today or nearest available day -----------
-    card = None
-    card_day = ""
+    card, card_day = None, ""
     for d in _card_dates():
         card = _race_card(d)
         if card and card.get("races"):
@@ -176,52 +198,93 @@ if page == "nav_today":
     else:
         title = _L("card_title") if card_day == today.isoformat() else _L("card_of").format(d=card_day)
         st.subheader(f"🏇 {title} · {card.get('venue','')}")
-        d0 = dt.date.fromisoformat(card_day)
-        day_keys = {
-            (d0 - dt.timedelta(days=1)).isoformat(),
-            d0.isoformat(),
-            (d0 + dt.timedelta(days=1)).isoformat(),
-        }
-        tips_map = _tips_by_name(day_keys)
+        num_map, name_map = _tip_maps(card_day)
+        day_tips = tips_all[tips_all["race_date"].isin(
+            {(dt.date.fromisoformat(card_day) - dt.timedelta(days=1)).isoformat(), card_day,
+             (dt.date.fromisoformat(card_day) + dt.timedelta(days=1)).isoformat()}
+        )] if not tips_all.empty else pd.DataFrame()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric(_L("metric_races"), len(card["races"]))
+        c2.metric(_L("metric_tips"), len(day_tips))
+        c3.metric(_L("metric_tipsters"), day_tips["tipster"].nunique() if not day_tips.empty else 0)
+
+        brandnos = tuple(
+            str(r.get("brandno") or "").strip().upper()
+            for race in card["races"] for r in race.get("energy", [])
+            if str(r.get("brandno") or "").strip()
+        )
+        summaries = _form_summaries(card_day, tuple(sorted(set(brandnos))))
 
         for race in card["races"]:
             info = race.get("raceinfo_chi") or race.get("raceinfo_eng") or {}
             en = st.session_state.lang == "en"
             rname = (race.get("raceinfo_eng") or info).get("RaceName", "") if en else info.get("RaceName", "")
+            raceno = str(race.get("raceno", "?"))
             label = _L("race_x").format(
                 n=race.get("raceno", "?"),
-                name=rname,
-                dist=info.get("Distance", ""),
-                cls=info.get("RaceClass", ""),
+                name=rname, dist=info.get("Distance", ""), cls=info.get("RaceClass", ""),
                 time=info.get("PostTime", ""),
             )
             runners = [r for r in race.get("energy", []) if not r.get("scratched")]
+
+            # per-tipster picks line for this race (from numbered tips)
+            tip_lines = []
+            race_tips = day_tips[day_tips["race_no"].astype(str).str.replace(".0", "", regex=False) == raceno] if not day_tips.empty else pd.DataFrame()
+            if not race_tips.empty:
+                for tipster, g in race_tips.groupby("tipster"):
+                    picks = []
+                    for _, rr in g.iterrows():
+                        hn = rr.get("horse_no")
+                        if pd.notna(hn) and str(hn).strip():
+                            nm = str(rr.get("horse_name") or "").strip()
+                            picks.append(f"{int(float(hn))} {nm}".strip())
+                    if picks:
+                        tip_lines.append(f"**{tipster}**: " + "、".join(picks))
+
             rows = []
             for r in runners:
+                brand = str(r.get("brandno") or "").strip().upper()
                 nm_chi = str(r.get("name_chi") or "").strip()
                 nm_en = str(r.get("name_eng") or r.get("name") or "").strip()
-                who = tips_map.get(norm_name(nm_chi), []) or tips_map.get(norm_name(nm_en.upper()), [])
-                if st.session_state.lang == "zh":
-                    display = f"⭐ {nm_chi}" if who else nm_chi
+                display_name = nm_en if en else nm_chi
+                who = list(num_map.get((raceno, str(r.get("runnernumber")).strip()), []))
+                who += [w for w in name_map.get(norm_name(nm_chi), []) if w not in who]
+                if not en and who:
+                    display_name = f"⭐ {display_name}"
+
+                fs = summaries.get(brand, {}).get("sum", {})
+                combo = summaries.get(brand, {}).get("combo", {})
+                if fs:
+                    record = _fmt_record(fs)
+                    last_jockey = fs.get("last_jockey", "")
+                    combo_txt = (
+                        f"{combo['runs']}{_L('runs_unit')}{combo['wins']}{_L('win_unit')}{combo['places'] - combo['wins']}{_L('place_unit')}"
+                        if combo else "—"
+                    )
                 else:
-                    display = f"⭐ {nm_en}" if who else nm_en
+                    record, last_jockey, combo_txt = "—", "—", "—"
                 try:
                     energy = int(str(r.get("speedproenergy") or "0").strip() or 0)
                 except ValueError:
                     energy = 0
-                rows.append(
-                    {
-                        _L("col_runner"): r.get("runnernumber"),
-                        _L("col_horse2"): display,
-                        _L("col_draw"): r.get("draw"),
-                        _L("col_energy"): energy,
-                        _L("col_diff"): r.get("speedproenergydifference"),
-                        _L("col_fitness"): r.get("fitnessrating"),
-                        _L("col_tips"): "、".join(who),
-                    }
-                )
-            has_tips = any(row[_L("col_tips")] for row in rows)
+                rows.append({
+                    _L("col_runner"): r.get("runnernumber"),
+                    _L("col_horse2"): display_name,
+                    _L("col_draw"): r.get("draw"),
+                    _L("col_energy"): energy,
+                    _L("col_diff"): r.get("speedproenergydifference"),
+                    _L("col_fitness"): r.get("fitnessrating"),
+                    _L("col_record"): record,
+                    _L("col_last_jockey"): last_jockey,
+                    _L("col_combo"): combo_txt,
+                    _L("col_tips"): "、".join(who),
+                })
+
+            has_tips = bool(tip_lines)
             with st.expander(label, expanded=has_tips):
+                if tip_lines:
+                    st.markdown(("🎯 " + "　|　".join(tip_lines)))
                 st.dataframe(
                     pd.DataFrame(rows),
                     hide_index=True,
@@ -233,7 +296,6 @@ if page == "nav_today":
                     },
                 )
 
-    # --- latest results (collapsed) ------------------------------------------
     recent = data_hub.recent_race_days(dt.date.today(), 1)
     if recent:
         last_day = str(recent[0])
@@ -250,7 +312,7 @@ elif page == "nav_search":
         st.session_state.search_df = pd.DataFrame()
 
     if st.button(_L("btn_fetch"), type="primary"):
-        with st.spinner("星島頭條 ..."):
+        with st.spinner("東網馬經 · 星島頭條 ..."):
             st.session_state.search_df = tip_sources.collect_news_tips(days=days)
 
     df = st.session_state.search_df
@@ -271,7 +333,7 @@ elif page == "nav_search":
             )
     else:
         arts = df.drop_duplicates(subset=["url"])
-        st.markdown(f"**{len(arts)}** 篇文章 · **{len(df)}** {_L('col_mentions')}")
+        st.markdown(f"**{len(arts)}** 篇 · **{len(df)}** {_L('col_mentions')}")
         st.dataframe(
             arts[["race_date", "tipster", "title", "source", "url"]],
             column_config={
@@ -304,26 +366,38 @@ elif page == "nav_consensus":
         width="stretch",
         hide_index=True,
     )
-    fig = px.bar(
-        cons.head(20),
-        x="pick",
-        y="mentions",
-        color="n_sources",
-        hover_data=["tipsters", "race_date"],
-        title="Top 20",
-    )
+    fig = px.bar(cons.head(20), x="pick", y="mentions", color="n_sources",
+                 hover_data=["tipsters", "race_date"], title="Top 20")
     st.plotly_chart(fig, width="stretch")
 
 elif page == "nav_analysis":
     st.header(_L("nav_analysis"))
-    st.subheader(_L("analysis_source_title"))
-    ss = analysis.source_stats(tips_all)
-    if ss.empty:
+
+    st.subheader(_L("tipster_title"))
+    if tips_all.empty:
         st.info(_L("no_tips"))
     else:
+        ts = (
+            tips_all.groupby("tipster")
+            .agg(source=("source", "first"), tips=("url", "count"), days=("race_date", "nunique"))
+            .reset_index()
+            .sort_values("tips", ascending=False)
+        )
+        st.dataframe(ts, width="stretch", hide_index=True)
+
+    st.divider()
+    st.subheader(_L("jockey_title"))
+    jp = _jockey_profiles()
+    if not jp.empty:
+        show = jp.head(20)[["jockey", "rides", "win_cnt", "win_pct", "place_pct"]].copy()
+        show.columns = [_L("col_jockey"), _L("col_rides"), _L("col_wins"), _L("col_winpct"), _L("col_placepct")]
+        st.dataframe(show, width="stretch", hide_index=True)
+
+    st.divider()
+    st.subheader(_L("analysis_source_title"))
+    ss = analysis.source_stats(tips_all)
+    if not ss.empty:
         st.dataframe(ss, width="stretch", hide_index=True)
-        fig = px.bar(ss.head(15), x="source", y="tips", color="kind")
-        st.plotly_chart(fig, width="stretch")
 
     st.divider()
     st.subheader(_L("analysis_horse_title"))
@@ -368,6 +442,8 @@ elif page == "nav_past":
     st.dataframe(analysis.performance_table(ev, by=None), width="stretch")
     st.subheader(_L("past_by_source"))
     st.dataframe(analysis.performance_table(ev, by="source"), width="stretch", hide_index=True)
+    st.subheader(_L("past_by_tipster"))
+    st.dataframe(analysis.performance_table(ev, by="tipster"), width="stretch", hide_index=True)
     st.subheader(_L("data_view"))
     show = ev[["race_no", "horse_no", "horse_name", "matched_horse", "source", "tipster", "place", "win_odds", "is_win"]]
     st.dataframe(show, width="stretch", hide_index=True)
@@ -395,8 +471,7 @@ elif page == "nav_data":
         except Exception:
             imp = pd.DataFrame()
         if not {"race_date", "horse_no"}.issubset(set(imp.columns)) and not {
-            "race_date",
-            "horse_name",
+            "race_date", "horse_name",
         }.issubset(set(imp.columns)):
             st.error(_L("upload_bad"))
         else:
@@ -427,23 +502,19 @@ elif page == "nav_data":
         else:
             pick = mpick.strip()
             is_num = pick.isdigit()
-            row = pd.DataFrame(
-                [
-                    {
-                        "fetched_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "race_date": mdate.isoformat(),
-                        "race_no": int(mrace),
-                        "horse_no": int(pick) if is_num else "",
-                        "horse_name": "" if is_num else pick,
-                        "source": msource or "Manual",
-                        "tipster": mtipster,
-                        "title": "",
-                        "url": "",
-                        "kind": "manual",
-                        "note": mnote,
-                    }
-                ]
-            )
+            row = pd.DataFrame([{
+                "fetched_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "race_date": mdate.isoformat(),
+                "race_no": int(mrace),
+                "horse_no": int(pick) if is_num else "",
+                "horse_name": "" if is_num else pick,
+                "source": msource or "Manual",
+                "tipster": mtipster,
+                "title": "",
+                "url": "",
+                "kind": "manual",
+                "note": mnote,
+            }])
             n = storage.save_tips(row, manual=True)
             st.success(_L("manual_saved").format(n=n))
 
@@ -452,8 +523,9 @@ else:  # nav_about
     st.subheader(_L("about_sources"))
     st.markdown(
         """
-- **[星島頭條 · 馬經](https://www.stheadline.com/racing/馬經)** — 貼士專欄（亨利拆局、馬觀微、Dickson心水…），每條貼士都註明 tipster 同文章連結
-- **[tianxi-database](https://github.com/sleepingarhat/tianxi-database)** — HKJC 排位(SpeedPro)、賽果、馬匹/騎練統計、賽期（公開 CSV/JSON，每日自動更新）
+- **[東網馬經 racing.on.cc](https://racing.on.cc/)** — 名家推介／西門獨／諸葛數／兆文 等貼士（有場次＋馬號）
+- **[星島頭條 · 馬經](https://www.stheadline.com/racing/馬經)** — 亨利拆局、馬觀微、Dickson心水 等專欄
+- **[tianxi-database](https://github.com/sleepingarhat/tianxi-database)** — HKJC SpeedPro 排位、賽果、馬匹出賽紀錄、騎師統計、賽期
 - **[HKJC 香港賽馬會](https://racing.hkjc.com)** — 官方數據版權持有人
         """
     )
