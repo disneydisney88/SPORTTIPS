@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import sqlite3
 from io import StringIO
 from pathlib import Path
 
@@ -34,6 +35,23 @@ def _get_text(path: str, timeout: int = 20) -> str | None:
         return None
 
 
+DB_PATH = Path(__file__).resolve().parents[1] / "data" / "sporttips.db"
+
+
+def db_query(sql: str, params: tuple = ()) -> pd.DataFrame | None:
+    """Read from the pre-installed SQLite DB (data/sporttips.db); None if absent."""
+    if not DB_PATH.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        try:
+            return pd.read_sql_query(sql, con, params=params)
+        finally:
+            con.close()
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        return None
+
+
 # -- cached loaders (no streamlit dependency so scripts can reuse these) -----
 _results_cache: dict[str, pd.DataFrame | None] = {}
 
@@ -48,18 +66,20 @@ def fixtures() -> pd.DataFrame:
 
 
 def results(race_day: str) -> pd.DataFrame | None:
-    """Results for one race day, e.g. results('2026-09-09'). Cached in-process."""
-    key = str(race_day)
-    if key in _results_cache:
-        return _results_cache[key]
-    txt = _get_text(f"data/{key[:4]}/results_{key}.csv")
+    """Results for one race day — pre-installed DB first, remote CSV fallback."""
+    day = str(race_day)
+    db = db_query("SELECT * FROM results WHERE date = ?", (day,))
+    if db is not None:
+        if not db.empty:
+            return db
+        return None
+    txt = _get_text(f"data/{day[:4]}/results_{day}.csv")
     df = None
     if txt:
         try:
             df = pd.read_csv(StringIO(txt), encoding="utf-8-sig")
         except Exception:
             df = None
-    _results_cache[key] = df
     return df
 
 
@@ -88,8 +108,10 @@ def horse_form(brand_no: str) -> pd.DataFrame | None:
 
 
 def horse_vocab() -> set[str]:
-    """All HK horse names (2016-2026) from the pedigree file — used to filter
-    quoted names scraped from media so only real horse names count as tips."""
+    """All HK horse names — pre-installed DB first, remote pedigree fallback."""
+    db = db_query("SELECT name FROM horse_names")
+    if db is not None and not db.empty:
+        return set(db["name"].astype(str))
     txt = _get_text("data/pedigree/horse_pedigree.csv")
     if not txt:
         return set()
@@ -192,8 +214,15 @@ def hkjc_meeting(race_day: str) -> dict | None:
 
 
 def horse_stats(brand_no: str, jockey_today: str = "") -> dict:
-    """Career summary + jockey-horse combo (today's jockey if given, else last)."""
-    df = horse_form(brand_no)
+    """Career summary + jockey-horse combo — pre-installed DB first, CSV fallback."""
+    code = str(brand_no).strip().upper()
+    df = db_query(
+        "SELECT date, place, jockey, distance_m FROM results WHERE horse_code = ? "
+        "ORDER BY date DESC, race_no DESC",
+        (code,),
+    )
+    if df is None:
+        df = horse_form(code)
     if df is None or df.empty:
         return {}
     placed = pd.to_numeric(df["place"], errors="coerce")
@@ -203,7 +232,7 @@ def horse_stats(brand_no: str, jockey_today: str = "") -> dict:
         return {}
     wins = int((valid == 1).sum())
     places = int(valid.between(1, 3).sum())
-    last_date = df["date"].dropna().max()
+    last_date = pd.to_datetime(df["date"], errors="coerce", dayfirst=False).dropna().max()
     last_jockey = str(df.iloc[0].get("jockey", "") or "").strip()
 
     target = jockey_today.strip() or last_jockey

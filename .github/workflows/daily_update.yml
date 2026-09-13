@@ -33,6 +33,9 @@ jobs:
       - name: Fetch tips
         run: python scripts/auto_fetch.py
 
+      - name: Update pre-installed DB
+        run: python scripts/build_db.py
+
       - name: Commit data
         run: |
           git config user.name "sporttips-bot"
